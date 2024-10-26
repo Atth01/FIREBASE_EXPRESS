@@ -1,5 +1,6 @@
 const express = require('express');
 const admin = require('firebase-admin');
+const fetch = require('node-fetch');
 const app = express();
 const port = 3002;
 
@@ -7,140 +8,111 @@ const port = 3002;
 const serviceAccount = require('./firebase-service-account.json');
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount),
-  databaseURL: 'https://wst-project-5444c-default-rtdb.firebaseio.com'  // Ganti dengan URL Firebase Database kamu
+  databaseURL: 'https://wst-project-5444c-default-rtdb.firebaseio.com'
 });
-
-const db = admin.database();
 
 app.use(express.json());
 
-// Route GET untuk menampilkan semua user atau berdasarkan parameter query 'nama'
-app.get('/users', (req, res) => {
-  const { nama } = req.query;
+// Endpoint untuk mendaftar pengguna
+app.post('/register', async (req, res) => {
+  const { email, password } = req.body;
 
-  db.ref('users').once('value')
-    .then((snapshot) => {
-      if (snapshot.exists()) {
-        const users = snapshot.val();
-        if (nama) {
-          const filteredUsers = {};
-          Object.keys(users).forEach((key) => {
-            if (users[key].nama && users[key].nama.toLowerCase() === nama.toLowerCase()) {
-              filteredUsers[key] = users[key];
-            }
-          });
+  try {
+    // Mendaftar pengguna baru
+    const userRecord = await admin.auth().createUser({
+      email: email,
+      password: password,
+    });
 
-          if (Object.keys(filteredUsers).length === 0) {
-            return res.status(404).send({ message: 'No users found with the given name' });
-          }
-          return res.status(200).json(filteredUsers);
-        }
-        return res.status(200).json(users);
-      } else {
-        return res.status(404).send({ message: 'No users found in the database' });
+    // Membuat custom token
+    const customToken = await admin.auth().createCustomToken(userRecord.uid);
+
+    // Menukar custom token menjadi ID token
+    const response = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:signInWithCustomToken?key=AIzaSyA9Q4EcDfMKIKvx5Gol156g-JZe7kgW2SA`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: customToken, returnSecureToken: true })
       }
+    );
+
+    const data = await response.json();
+    if (data.idToken) {
+      // Mengirimkan ID token ke klien
+      res.status(200).send({ token: data.idToken });
+    } else {
+      throw new Error('Failed to retrieve ID token');
+    }
+  } catch (error) {
+    console.error('Error registering user:', error.message);
+    res.status(500).send({ error: 'Error registering user: ' + error.message });
+  }
+});
+
+// Middleware untuk memverifikasi token
+const verifyToken = (req, res, next) => {
+  const token = req.headers.authorization && req.headers.authorization.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).send({ message: 'No token provided' });
+  }
+
+  // Verifikasi ID token
+  admin.auth().verifyIdToken(token)
+    .then((decodedToken) => {
+      req.uid = decodedToken.uid; // Menyimpan UID di request
+      next(); // Melanjutkan ke middleware/route berikutnya
     })
     .catch((error) => {
-      console.error('Error fetching users: ', error.message);
-      res.status(500).send({ error: 'Error fetching users: ' + error.message });
+      console.error('Error verifying token:', error.message);
+      res.status(401).send({ error: 'Invalid token' });
+    });
+};
+
+// Endpoint untuk memverifikasi ID token
+app.post('/verify-token', (req, res) => {
+  const { token } = req.body;
+
+  if (!token) {
+    return res.status(400).send({ message: 'Token harus disediakan' });
+  }
+
+  // Verifikasi ID token
+  admin.auth().verifyIdToken(token)
+    .then((decodedToken) => {
+      const uid = decodedToken.uid;
+      res.status(200).send({ message: 'Token valid', uid: uid });
+    })
+    .catch((error) => {
+      console.error('Error verifying token: ', error.message);
+      res.status(401).send({ error: 'Invalid token' });
     });
 });
 
-// Route POST untuk menambahkan user baru ke Firebase
-app.post('/users', (req, res) => {
-  const { nama, username, password } = req.body;
+// Endpoint untuk mengambil semua data pengguna
+app.get('/data', verifyToken, async (req, res) => {
+  try {
+    // Mengambil semua data dari Realtime Database
+    const usersRef = admin.database().ref('users'); // Ganti 'users' sesuai dengan struktur database Anda
+    const snapshot = await usersRef.once('value');
 
-  // Validasi apakah semua data yang diperlukan ada
-  if (!nama || !username || !password) {
-    return res.status(400).send({ message: 'Nama, username, dan password harus diisi' });
+    const data = snapshot.val();
+
+    if (data) {
+      res.status(200).send({
+        message: 'Data berhasil diambil',
+        data: data // Kirimkan semua data pengguna yang diambil
+      });
+    } else {
+      res.status(404).send({
+        message: 'Data tidak ditemukan'
+      });
+    }
+  } catch (error) {
+    console.error('Error retrieving data:', error.message);
+    res.status(500).send({ error: 'Terjadi kesalahan saat mengambil data' });
   }
-
-  // Tambahkan data baru ke Firebase dengan method push
-  db.ref('users').push({
-    nama: nama,
-    username: username,
-    password: password
-  })
-    .then(() => {
-      res.status(201).send({ message: 'User berhasil ditambahkan!' });
-    })
-    .catch((error) => {
-      console.error('Error adding user: ', error.message);
-      res.status(500).send({ error: 'Error adding user: ' + error.message });
-    });
-});
-
-// Route PUT untuk mengedit user berdasarkan 'nama'
-app.put('/users', (req, res) => {
-  const { nama, newUsername, newPassword } = req.body;
-
-  // Validasi apakah semua data yang diperlukan ada
-  if (!nama || !newUsername || !newPassword) {
-    return res.status(400).send({ message: 'Nama, newUsername, dan newPassword harus diisi' });
-  }
-
-  // Cari user berdasarkan nama
-  db.ref('users').orderByChild('nama').equalTo(nama).once('value')
-    .then((snapshot) => {
-      if (snapshot.exists()) {
-        // Mendapatkan key (ID) user yang cocok
-        const userId = Object.keys(snapshot.val())[0];
-
-        // Update data user berdasarkan key yang ditemukan
-        db.ref(`users/${userId}`).update({
-          username: newUsername,
-          password: newPassword
-        })
-          .then(() => {
-            res.status(200).send({ message: `User dengan nama: ${nama} berhasil diperbarui!` });
-          })
-          .catch((error) => {
-            console.error('Error updating user: ', error.message);
-            res.status(500).send({ error: 'Error updating user: ' + error.message });
-          });
-      } else {
-        res.status(404).send({ message: 'User dengan nama tersebut tidak ditemukan' });
-      }
-    })
-    .catch((error) => {
-      console.error('Error finding user: ', error.message);
-      res.status(500).send({ error: 'Error finding user: ' + error.message });
-    });
-});
-
-// Route DELETE untuk menghapus user berdasarkan 'nama'
-app.delete('/users', (req, res) => {
-  const { nama } = req.body;
-
-  // Validasi apakah nama disediakan
-  if (!nama) {
-    return res.status(400).send({ message: 'Nama harus diisi untuk menghapus user' });
-  }
-
-  // Cari user berdasarkan nama
-  db.ref('users').orderByChild('nama').equalTo(nama).once('value')
-    .then((snapshot) => {
-      if (snapshot.exists()) {
-        // Mendapatkan key (ID) user yang cocok
-        const userId = Object.keys(snapshot.val())[0];
-
-        // Hapus user berdasarkan key
-        db.ref(`users/${userId}`).remove()
-          .then(() => {
-            res.status(200).send({ message: `User dengan nama: ${nama} berhasil dihapus!` });
-          })
-          .catch((error) => {
-            console.error('Error deleting user: ', error.message);
-            res.status(500).send({ error: 'Error deleting user: ' + error.message });
-          });
-      } else {
-        res.status(404).send({ message: 'User dengan nama tersebut tidak ditemukan' });
-      }
-    })
-    .catch((error) => {
-      console.error('Error finding user: ', error.message);
-      res.status(500).send({ error: 'Error finding user: ' + error.message });
-    });
 });
 
 // Jalankan server
